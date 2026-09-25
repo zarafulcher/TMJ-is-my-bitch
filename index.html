@@ -370,7 +370,7 @@ input[type=file]{width:100%;font-size:15px;color:var(--muted);padding:10px 0}
    Everything lives on this device in IndexedDB: the plan as
    one document, video and photo files in their own store.
    ============================================================ */
-const APP_VERSION = '3.6';
+const APP_VERSION = '4.0';
 const DB_NAME = 'ledger', DB_VER = 1;
 let _db = null;
 
@@ -396,6 +396,7 @@ function idbDel(name, key){ return store(name,'readwrite').then(s => new Promise
 let S = null;
 const urlCache = new Map();
 const uid = () => Math.random().toString(36).slice(2,10);
+const DEVICE = (()=>{ try{ let d = localStorage.getItem('ledger-device'); if(!d){ d = uid(); localStorage.setItem('ledger-device', d); } return d; }catch(e){ return 'here'; } })();
 const pad = n => String(n).padStart(2,'0');
 // Local calendar date. v1 used UTC, which filed Melbourne mornings under yesterday.
 const dayKey = (d = new Date()) => d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());
@@ -494,6 +495,7 @@ async function flush(){
   const waiting = _saveWaiters; _saveWaiters = [];
   try{ await idbPut('doc','state', S); }catch(e){ console.error('save failed', e); }
   waiting.forEach(f=>f(true));
+  if(typeof scheduleSync === 'function') scheduleSync();
 }
 async function putMedia(file){
   const id = uid();
@@ -509,8 +511,17 @@ async function mediaURL(id){
   urlCache.set(id, url);
   return url;
 }
+// Items synced from another device may point at files that only exist there.
+async function mediaFor(t){
+  if(!t) return null;
+  const m = t.mediaIds || {};
+  const ids = [m[DEVICE], t.mediaId, ...Object.values(m)].filter(Boolean);
+  for(const id of [...new Set(ids)]){ const u = await mediaURL(id); if(u) return u; }
+  return null;
+}
+const hasMedia = t => !!(t.mediaId || (t.mediaIds && Object.keys(t.mediaIds).length));
 async function probeVideo(t){
-  const url = await mediaURL(t.mediaId);
+  const url = await mediaFor(t);
   if(!url) return;
   await new Promise(res=>{
     const v = document.createElement('video');
@@ -794,6 +805,7 @@ function viewToday(){
       <div style="height:12px"></div><button class="btn" data-act="newroutine">Make a routine</button></div>`;
   }
   h += `<div class="section">`;
+  if(SYNC.err && SYNC.err.auth) h += `<button class="softpill" data-act="gosync">⚠️ Sync is paused. Tap to fix</button>`;
   if(!due.length) h += `<div class="empty">Nothing scheduled for ${DAYS_LONG[now.getDay()]} on ${levelOf(lv).name}. Everything else is below.</div><div style="height:16px"></div>`;
   due.forEach(r=>{ h += routineGroup(r, true); });
   h += `</div>`;
@@ -1021,7 +1033,7 @@ function buildBulk(){
 }
 function currentTheme(){ return document.documentElement.getAttribute('data-theme') || 'light'; }
 function buildSettings(){
-  return `<div class="section">${label('Appearance','t0')}
+  return syncSettingsHTML() + `<div class="section">${label('Appearance','t0')}
     <div class="seg">${[['light','Light'],['dark','Dark'],['system','Match phone']].map(([k,w])=>`<button data-act="theme" data-id="${k}" aria-pressed="${currentTheme()===k}">${w}</button>`).join('')}</div>
   </div>
   <div class="section">${label('Tracking','t2')}
@@ -1222,8 +1234,8 @@ async function saveTool(id){
   if(t.kind==='text' && !(t.text||'').trim()){ alert('Add the instructions.'); return; }
   if(t.kind==='text' && !t.title) t.title = t.text.trim().split('\n')[0].slice(0,48);
   if(!t.title){ alert('Give it a name so you can find it later.'); return; }
-  if(draftFile){ t.mediaId = await putMedia(draftFile); t.dur = null; }
-  if((t.kind==='video'||t.kind==='image') && !t.mediaId){ alert('Choose a file, or pick a different type.'); return; }
+  if(draftFile){ t.mediaIds = Object.assign({}, t.mediaIds, { [DEVICE]: await putMedia(draftFile) }); t.dur = null; }
+  if((t.kind==='video'||t.kind==='image') && !hasMedia(t)){ alert('Choose a file, or pick a different type.'); return; }
   if((t.kind==='text'||t.kind==='image') && !t.seconds) t.seconds = 30;
   t.id = id || uid();
   S.tools[t.id] = t;
@@ -1236,7 +1248,7 @@ async function saveTool(id){
 async function deleteTool(id){
   if(!confirm('Delete this item everywhere it appears? Your log keeps its name.')) return;
   const t = S.tools[id];
-  if(t && t.mediaId){ try{ await idbDel('media', t.mediaId); }catch(e){} }
+  if(t){ for(const m of [t.mediaId, ...Object.values(t.mediaIds||{})].filter(Boolean)){ try{ await idbDel('media', m); }catch(e){} } }
   delete S.tools[id];
   Object.values(S.nodes).forEach(n=>{ n.toolIds = n.toolIds.filter(x=>x!==id); });
   S.routines.forEach(r=>{ r.itemIds = r.itemIds.filter(x=>x!==id); });
@@ -1515,13 +1527,13 @@ async function importFiles(files, defaults){
     const kind = (f.type||'').startsWith('image/') ? 'image' : 'video';
     const mediaId = await putMedia(f);
     const name = (f.name||'').replace(/\.[^.]+$/,'').replace(/[_-]+/g,' ').trim();
-    const t = { id:uid(), kind, title: name || 'New ' + KIND[kind].word.toLowerCase(), mediaId, seconds: kind==='image' ? 30 : 0, reps:1, tags:[], text:'' };
+    const t = { id:uid(), kind, title: name || 'New ' + KIND[kind].word.toLowerCase(), mediaIds:{ [DEVICE]: mediaId }, seconds: kind==='image' ? 30 : 0, reps:1, tags:[], text:'' };
     S.tools[t.id] = t; n++;
     if(defaults.node) attachTool(defaults.node, t.id);
     if(defaults.routine) addToRoutine(defaults.routine, t.id);
   }
   await save();
-  Object.values(S.tools).filter(t=>t.kind==='video' && !t.dur && t.mediaId).reduce((p,t)=>p.then(()=>probeVideo(t)), Promise.resolve());
+  Object.values(S.tools).filter(t=>t.kind==='video' && !t.dur && hasMedia(t)).reduce((p,t)=>p.then(()=>probeVideo(t)), Promise.resolve());
   return n;
 }
 function bulkDefaults(){
@@ -1659,8 +1671,8 @@ async function step(){
   setBar(0); setItemText('');
 
   if(t.kind==='video'){
-    const url = await mediaURL(t.mediaId); if(my!==P.token) return;
-    if(!url){ showLinkCard(t, 'The video file for this item isn’t on this phone.'); return; }
+    const url = await mediaFor(t); if(my!==P.token) return;
+    if(!url){ showLinkCard(t, 'This clip’s video file is on another device. To play it here, open it from Library with ⋯ and choose the file on this device too.'); return; }
     const v = V();
     v.style.display = 'block'; v.loop = false; v.src = url;
     v.onloadedmetadata = ()=>{ if(isFinite(v.duration) && v.duration>0 && !t.dur){ t.dur = Math.round(v.duration*10)/10; save(); } };
@@ -1676,7 +1688,7 @@ async function step(){
       };
     }
   } else if(t.kind==='image'){
-    const url = await mediaURL(t.mediaId); if(my!==P.token) return;
+    const url = await mediaFor(t); if(my!==P.token) return;
     const img = $('#pimg'); img.src = url || ''; img.style.display = 'block';
     if(t.text){ $('#ptextbody').textContent = t.text; $('#ptext').classList.add('on','caption'); }
     startTimer((t.seconds||30)*1000);
@@ -1864,6 +1876,319 @@ function startFromFind(tid, nodeId){
 }
 
 /* ============================================================
+   Sync across devices through a private GitHub repository.
+   The token and repository live only in this device's local
+   settings: never in the plan, backups, or the app's code.
+   ============================================================ */
+const SYNC_FILE = 'ledger.json';
+const SYNC = { busy:false, again:false, timer:null, applying:false, err:null, last:0 };
+try{ SYNC.last = +localStorage.getItem('ledger-sync-last') || 0; }catch(e){}
+
+function syncCfg(){
+  try{ const c = JSON.parse(localStorage.getItem('ledger-sync') || 'null'); return c && c.repo && c.token ? c : null; }
+  catch(e){ return null; }
+}
+function deviceLabel(){
+  const u = navigator.userAgent || '';
+  return /iPhone/.test(u) ? 'iPhone' : /iPad/.test(u) ? 'iPad' : /Macintosh/.test(u) ? 'Mac' : 'browser';
+}
+function b64encode(str){
+  const bytes = new TextEncoder().encode(str); let bin = '';
+  for(let i=0; i<bytes.length; i+=0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i+0x8000));
+  return btoa(bin);
+}
+function b64decode(b64){
+  const bin = atob(String(b64).replace(/\s/g,'')), bytes = new Uint8Array(bin.length);
+  for(let i=0; i<bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+// JSON with sorted keys, so two copies of the same data always compare equal
+function stable(v){
+  if(v === undefined) return 'undefined';
+  if(v === null || typeof v !== 'object') return JSON.stringify(v);
+  if(Array.isArray(v)) return '[' + v.map(stable).join(',') + ']';
+  return '{' + Object.keys(v).filter(k=>v[k]!==undefined).sort().map(k=>JSON.stringify(k)+':'+stable(v[k])).join(',') + '}';
+}
+const clone = v => v === undefined ? undefined : JSON.parse(JSON.stringify(v));
+const same = (a, b) => stable(a) === stable(b);
+
+class SyncError extends Error{ constructor(msg, auth, conflict){ super(msg); this.auth = !!auth; this.conflict = !!conflict; } }
+function ghError(status){
+  if(status===401) return new SyncError('GitHub didn’t accept the token. It may have expired: paste a new one below.', true);
+  if(status===403) return new SyncError('The token isn’t allowed to change this repository. It needs Contents: Read and write.', true);
+  if(status===404) return new SyncError('Can’t find that repository with this token. Check the name and that the token was given access to it.', true);
+  if(status===409 || status===422) return new SyncError('Another device saved at the same moment.', false, true);
+  return new SyncError('GitHub had a problem (' + status + '). Trying again later.');
+}
+async function gh(cfg, path, opts){
+  opts = opts || {};
+  // Only Authorization, Accept and Content-Type, which GitHub accepts from web pages.
+  const headers = { 'Authorization':'Bearer ' + cfg.token, 'Accept': opts.accept || 'application/vnd.github+json' };
+  if(opts.body) headers['Content-Type'] = 'application/json';
+  const method = opts.method || 'GET';
+  const url = 'https://api.github.com' + path + (method === 'GET' ? (path.includes('?') ? '&' : '?') + '_=' + Date.now() : '');   // never a stale cached copy
+  let res;
+  try{ res = await fetch(url, { method, headers, body: opts.body ? JSON.stringify(opts.body) : undefined }); }
+  catch(e){ throw new SyncError('Offline. Changes will sync when you’re back online.'); }
+  return res;
+}
+async function ghRepo(cfg){
+  const res = await gh(cfg, '/repos/' + cfg.repo);
+  if(!res.ok) throw ghError(res.status);
+  return res.json();
+}
+async function ghGet(cfg){
+  const path = '/repos/' + cfg.repo + '/contents/' + SYNC_FILE;
+  const res = await gh(cfg, path);
+  if(res.status === 404) return null;
+  if(!res.ok) throw ghError(res.status);
+  const j = await res.json();
+  let text;
+  if(j.content && j.encoding === 'base64') text = b64decode(j.content);
+  else {   // files over 1 MB come back without inline content
+    const raw = await gh(cfg, path, { accept:'application/vnd.github.raw+json' });
+    if(!raw.ok) throw ghError(raw.status);
+    text = await raw.text();
+  }
+  return { sha:j.sha, data:JSON.parse(text) };
+}
+async function ghPut(cfg, data, sha){
+  const body = { message:'Ledger sync from ' + deviceLabel(), content:b64encode(stable(data)) };
+  if(sha) body.sha = sha;
+  const res = await gh(cfg, '/repos/' + cfg.repo + '/contents/' + SYNC_FILE, { method:'PUT', body });
+  if(!res.ok) throw ghError(res.status);
+  return (await res.json()).content.sha;
+}
+
+/* ---------- three-way merge: base = the last copy both sides agreed on ---------- */
+const ID_LISTS = new Set(['childIds','toolIds','itemIds']);
+const isObj = v => v && typeof v === 'object' && !Array.isArray(v);
+function mergeIdList(base, local, remote){
+  const b = new Set(base||[]), l = new Set(local), r = new Set(remote);
+  const out = local.filter(id => !(b.has(id) && !r.has(id)));          // drop what the other side removed
+  remote.forEach(id => { if(!b.has(id) && !l.has(id) && !out.includes(id)) out.push(id); });   // add what it added
+  return out;
+}
+function merge3(base, local, remote, key){
+  if(same(local, remote)) return clone(local);
+  if(same(local, base)) return clone(remote);
+  if(same(remote, base)) return clone(local);
+  if(ID_LISTS.has(key) && Array.isArray(local) && Array.isArray(remote)) return mergeIdList(base, local, remote);
+  if(isObj(local) && isObj(remote)){
+    const b = isObj(base) ? base : {}, out = {};
+    new Set([...Object.keys(b), ...Object.keys(local), ...Object.keys(remote)]).forEach(k=>{
+      const inL = k in local, inR = k in remote, inB = k in b;
+      if(!inL && !inR) return;
+      if(!inL){ if(!(inB && same(remote[k], b[k]))) out[k] = clone(remote[k]); return; }   // a change beats a deletion
+      if(!inR){ if(!(inB && same(local[k], b[k]))) out[k] = clone(local[k]); return; }
+      const v = merge3(inB ? b[k] : undefined, local[k], remote[k], k);
+      if(v !== undefined) out[k] = v;
+    });
+    return out;
+  }
+  return clone(local);   // the same value changed both ways: this device wins
+}
+function mergeSet(base, local, remote, keyOf){
+  const b = new Set(base.map(keyOf)), l = new Map(local.map(x=>[keyOf(x),x])), r = new Map(remote.map(x=>[keyOf(x),x]));
+  const out = [];
+  new Set([...l.keys(), ...r.keys()]).forEach(k=>{
+    const inB = b.has(k), inL = l.has(k), inR = r.has(k);
+    if(inB ? (inL && inR) : (inL || inR)) out.push(clone(l.get(k) || r.get(k)));
+  });
+  return out;
+}
+function logTriples(logs){
+  const out = [];
+  Object.entries(logs||{}).forEach(([d, byR])=>Object.entries(byR||{}).forEach(([r, ids])=>(ids||[]).forEach(t=>out.push(d+'|'+r+'|'+t))));
+  return out;
+}
+function mergeStates(base, local, remote){
+  base = base || {};
+  const out = {};
+  new Set([...Object.keys(local), ...Object.keys(remote)]).forEach(k=>{
+    if(k==='events'){
+      out.events = mergeSet(base.events||[], local.events||[], remote.events||[], e=>e.id).sort((a,b)=>a.ts-b.ts);
+    } else if(k==='logs'){
+      out.logs = {};
+      mergeSet(logTriples(base.logs), logTriples(local.logs), logTriples(remote.logs), x=>x).forEach(s=>{
+        const [d, r, t] = s.split('|');
+        ((out.logs[d] = out.logs[d] || {})[r] = out.logs[d][r] || []).push(t);
+      });
+    } else if(k==='routines'){
+      const toMap = a => Object.fromEntries((a||[]).map(r=>[r.id, r]));
+      const m = merge3(toMap(base.routines), toMap(local.routines), toMap(remote.routines), 'routines') || {};
+      const order = (local.routines||[]).map(r=>r.id).concat((remote.routines||[]).map(r=>r.id));
+      out.routines = [...new Set(order)].filter(id=>m[id]).map(id=>m[id]);
+    } else {
+      const v = merge3(base[k], local[k], remote[k], k);
+      if(v !== undefined) out[k] = v;
+    }
+  });
+  return tidy(out, local);
+}
+// Repair references after a merge so nothing points at something deleted and no branch is orphaned.
+function tidy(s, fallback){
+  s.nodes = s.nodes || {}; s.tools = s.tools || {};
+  if(!s.rootId || !s.nodes[s.rootId]){ s.rootId = fallback.rootId; s.nodes[s.rootId] = s.nodes[s.rootId] || clone(fallback.nodes[fallback.rootId]); }
+  const seen = new Set([s.rootId]);
+  const walk = id => {
+    const n = s.nodes[id];
+    n.toolIds = [...new Set((n.toolIds||[]).filter(t=>s.tools[t]))];
+    n.childIds = [...new Set((n.childIds||[]).filter(c=>s.nodes[c] && !seen.has(c)))];
+    n.childIds.forEach(c=>{ seen.add(c); s.nodes[c].parentId = id; });
+    n.childIds.forEach(walk);
+  };
+  walk(s.rootId);
+  Object.values(s.nodes).forEach(n=>{
+    if(seen.has(n.id)) return;
+    const p = s.nodes[n.parentId] && seen.has(n.parentId) ? n.parentId : s.rootId;
+    s.nodes[p].childIds.push(n.id); n.parentId = p; seen.add(n.id); walk(n.id);
+  });
+  (s.routines||[]).forEach(r=>{ r.itemIds = [...new Set((r.itemIds||[]).filter(t=>s.tools[t]))]; });
+  return s;
+}
+
+/* ---------- running a sync ---------- */
+function scheduleSync(ms){
+  if(!syncCfg() || SYNC.applying) return;
+  clearTimeout(SYNC.timer);
+  SYNC.timer = setTimeout(()=>syncNow(), ms == null ? 6000 : ms);
+}
+function hasContent(s){
+  return (s.events||[]).length || (s.routines||[]).length || Object.keys(s.tools||{}).length > 1 || Object.keys(s.nodes||{}).length > 8;
+}
+async function applyMerged(next){
+  migrate(next);
+  SYNC.applying = true;
+  try{ S = next; await idbPut('doc','state', S); } finally { SYNC.applying = false; }
+  const a = document.activeElement;
+  const typing = a && $('#app').contains(a) && /INPUT|TEXTAREA|SELECT/.test(a.tagName);
+  if(!typing && !playerOpen()) render();
+}
+async function syncNow(retry){
+  const cfg = syncCfg(); if(!cfg) return;
+  if(SYNC.busy){ SYNC.again = true; return; }
+  SYNC.busy = true; clearTimeout(SYNC.timer); updateSyncStatus();
+  try{
+    if(_saveTimer) await flush();
+    const remote = await ghGet(cfg);
+    const base = await idbGet('doc','syncbase');
+    let merged;
+    if(!remote) merged = clone(S);
+    else if(!base) merged = clone(remote.data);   // only reached if set-up was interrupted: trust the synced copy
+    else merged = mergeStates(base, S, remote.data);
+    if(!same(merged, S)) await applyMerged(merged);
+    if(!remote || !same(merged, remote.data)) await ghPut(cfg, merged, remote && remote.sha);
+    await idbPut('doc','syncbase', clone(merged));
+    SYNC.err = null; SYNC.last = Date.now();
+    try{ localStorage.setItem('ledger-sync-last', String(SYNC.last)); }catch(e){}
+  }catch(e){
+    if(e.conflict && !retry){ SYNC.busy = false; return syncNow(true); }
+    SYNC.err = { msg: e.message || String(e), auth: !!e.auth };
+  }finally{
+    SYNC.busy = false; updateSyncStatus();
+    if(SYNC.again){ SYNC.again = false; scheduleSync(800); }
+  }
+}
+async function connectSync(){
+  const repo = ($('#sync_repo').value || '').trim().replace(/^https?:\/\/github\.com\//,'').replace(/\.git$/,'').replace(/\/$/,'');
+  const token = ($('#sync_token').value || '').trim();
+  const say = (m, bad) => { const el = $('#sync_msg'); if(el){ el.textContent = m; el.classList.toggle('warn', !!bad); } };
+  if(!/^[\w.-]+\/[\w.-]+$/.test(repo)){ say('Type the repository as yourname/repository, for example zarafulcher/ledger-data.', true); return; }
+  if(!token){ say('Paste the access token.', true); return; }
+  const cfg = { repo, token };
+  say('Checking…');
+  try{
+    const info = await ghRepo(cfg);
+    if(info.private !== true){ say('That repository is public, so anyone could read your log. Make it private on GitHub (Settings → Danger Zone → Change visibility), or use a new private one.', true); return; }
+    const prev = syncCfg();
+    if(prev && prev.repo === repo && await idbGet('doc','syncbase')){
+      // already connected: just swap in the new token and carry on
+      try{ localStorage.setItem('ledger-sync', JSON.stringify(cfg)); }catch(e){}
+      SYNC.err = null; await syncNow(); render(); toast(SYNC.err ? 'Still not syncing' : 'Token updated'); return;
+    }
+    const remote = await ghGet(cfg);
+    try{ localStorage.setItem('ledger-sync', JSON.stringify(cfg)); }catch(e){ say('This browser won’t save settings.', true); return; }
+    if(!remote){
+      await ghPut(cfg, S, null);
+      await idbPut('doc','syncbase', clone(S));
+      SYNC.err = null; SYNC.last = Date.now(); try{ localStorage.setItem('ledger-sync-last', String(SYNC.last)); }catch(e){}
+      toast('Connected'); render(); return;
+    }
+    if(!hasContent(S)){ await adoptRemote(remote); return; }
+    SYNC._pending = remote;
+    openSheet(`<h2>Both have data</h2>
+      <div class="hint" style="margin-top:6px">The synced copy already has a library or log, and so does this device. Pick which one to keep. To combine them, cancel, export the library from one as a spreadsheet and paste it into the other, then connect again.</div>
+      <div style="height:16px"></div>
+      <button class="btn" data-act="syncuseremote">Use the synced copy here</button>
+      <div style="height:9px"></div>
+      <button class="btn ghost" data-act="syncuselocal">Replace the synced copy with this device’s</button>
+      <button class="btn quiet" data-act="synccancel">Cancel</button>`);
+  }catch(e){ say(e.message || String(e), true); }
+}
+async function adoptRemote(remote){
+  await applyMerged(clone(remote.data));
+  await idbPut('doc','syncbase', clone(remote.data));
+  SYNC.err = null; SYNC.last = Date.now(); try{ localStorage.setItem('ledger-sync-last', String(SYNC.last)); }catch(e){}
+  closeSheet(); findStack = []; toast('Connected'); render();
+}
+async function replaceRemote(){
+  const cfg = syncCfg(), remote = SYNC._pending;
+  try{
+    await ghPut(cfg, S, remote && remote.sha);
+    await idbPut('doc','syncbase', clone(S));
+    SYNC.err = null; SYNC.last = Date.now(); try{ localStorage.setItem('ledger-sync-last', String(SYNC.last)); }catch(e){}
+    closeSheet(); toast('Connected'); render();
+  }catch(e){ alert(e.message || String(e)); }
+}
+async function disconnectSync(){
+  if(!confirm('Stop syncing this device? Everything stays here and in the repository; they just stop updating each other.')) return;
+  try{ localStorage.removeItem('ledger-sync'); localStorage.removeItem('ledger-sync-last'); }catch(e){}
+  await idbDel('doc','syncbase');
+  SYNC.err = null; SYNC.last = 0; render();
+}
+function syncStatusText(){
+  if(!syncCfg()) return '';
+  if(SYNC.busy) return 'Syncing…';
+  if(SYNC.err) return SYNC.err.msg;
+  if(!SYNC.last) return 'Not synced yet.';
+  const d = new Date(SYNC.last);
+  return 'Last synced ' + (dayKey(d)===today() ? 'at ' + clock(SYNC.last) : d.toLocaleDateString('en-AU',{ day:'numeric', month:'short' }) + ' at ' + clock(SYNC.last)) + '.';
+}
+function updateSyncStatus(){
+  const el = document.getElementById('sync_status');
+  if(el){ el.textContent = syncStatusText(); el.classList.toggle('warn', !!SYNC.err); }
+}
+function syncSettingsHTML(){
+  const cfg = syncCfg();
+  if(cfg){
+    return `<div class="section">${label('Sync across devices','t1')}
+      <div class="card"><div class="title" style="font-size:16px">Syncing with ${esc(cfg.repo)}</div>
+        <div class="meta" id="sync_status">${esc(syncStatusText())}</div></div>
+      ${SYNC.err && SYNC.err.auth ? `<label class="f"><span>New access token</span><input type="text" id="sync_token" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="github_pat_…"></label>
+        <input type="hidden" id="sync_repo" value="${esc(cfg.repo)}"><div style="height:9px"></div>
+        <button class="btn" data-act="syncconnect">Update token</button><div class="hint" id="sync_msg"></div>` : ''}
+      <div style="height:9px"></div>
+      <div class="btnrow"><button class="btn ghost" data-act="syncnow">Sync now</button><button class="btn ghost" data-act="syncoff">Stop syncing</button></div>
+      <div class="hint">Syncs when you open Ledger and a few seconds after each change. Videos and photos stay on the device you added them on; YouTube links play everywhere. Every sync is saved in the repository’s history, so older versions can be recovered there.</div>
+    </div>`;
+  }
+  return `<div class="section">${label('Sync across devices','t1')}
+    <div class="hint" style="margin:0 0 4px">Keeps your phone, Mac and any other device in step through a private GitHub repository of your own. Do this once on each device.</div>
+    <label class="f"><span>Private repository</span><input type="text" id="sync_repo" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="zarafulcher/ledger-data"></label>
+    <label class="f"><span>Access token</span><input type="text" id="sync_token" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="github_pat_…"></label>
+    <div style="height:12px"></div>
+    <button class="btn" data-act="syncconnect">Connect</button>
+    <div class="hint" id="sync_msg"></div>
+    <div class="hint"><b>Setting up on github.com, once:</b><br>
+      1. New repository, named for example ledger-data, set to <b>Private</b>.<br>
+      2. Profile picture → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.<br>
+      3. Repository access: Only select repositories → ledger-data. Permissions → Repository permissions → Contents: <b>Read and write</b>.<br>
+      4. Copy the token and paste it here with the repository name. Use the same token on each device.</div>
+  </div>`;
+}
+
+/* ============================================================
    Events
    ============================================================ */
 document.addEventListener('click', async e=>{
@@ -1971,6 +2296,13 @@ document.addEventListener('click', async e=>{
     case 'export': exportPlan(); break;
     case 'import': importPlan(); break;
     case 'update': checkUpdate(); break;
+    case 'syncconnect': connectSync(); break;
+    case 'syncnow': syncNow(); break;
+    case 'syncoff': disconnectSync(); break;
+    case 'syncuseremote': if(SYNC._pending) adoptRemote(SYNC._pending); break;
+    case 'syncuselocal': replaceRemote(); break;
+    case 'synccancel': try{ localStorage.removeItem('ledger-sync'); }catch(e){} SYNC._pending = null; closeSheet(); render(); break;
+    case 'gosync': tab = 'build'; buildView = 'settings'; render(); toTop(); break;
 
     /* branches */
     case 'editnode': editNode(id); break;
@@ -2096,6 +2428,8 @@ $('#pmute').onclick = ()=>{
 };
 document.addEventListener('visibilitychange', ()=>{
   if(document.visibilityState==='hidden' && _saveTimer) flush();
+  if(document.visibilityState==='hidden' && SYNC.timer && syncCfg()) syncNow();
+  if(document.visibilityState==='visible' && syncCfg() && Date.now() - SYNC.last > 20000) syncNow();
   if(document.visibilityState==='visible' && playerOpen()) requestWake();
 });
 
@@ -2106,7 +2440,13 @@ document.addEventListener('visibilitychange', ()=>{
   try{ if(navigator.storage && navigator.storage.persist) await navigator.storage.persist(); }catch(e){}
   render();
   // measure clips saved before v2 so routine lengths and finish times are known
-  Object.values(S.tools).filter(t=>t.kind==='video' && !t.dur && t.mediaId)
+  for(const t of Object.values(S.tools)){
+    if(t.mediaId && !(t.mediaIds && Object.keys(t.mediaIds).length)){
+      try{ if(await idbGet('media', t.mediaId)){ t.mediaIds = { [DEVICE]: t.mediaId }; save(); } }catch(e){}
+    }
+  }
+  if(syncCfg()) setTimeout(()=>syncNow(), 300);
+  Object.values(S.tools).filter(t=>t.kind==='video' && !t.dur && hasMedia(t))
     .reduce((p,t)=>p.then(()=>probeVideo(t)), Promise.resolve())
     .then(()=>{ if(tab==='today' && !$('#sheet').classList.contains('open')) render(); });
   if('serviceWorker' in navigator){
