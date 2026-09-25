@@ -1,6 +1,6 @@
 // v2: the page itself is fetched fresh whenever there's a connection, so updates
 // arrive on their own. v1 served the first copy forever.
-const CACHE = 'ledger-v2';
+const CACHE = 'ledger-v3';
 const SHELL = ['./', './index.html', './manifest.json', './icon.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
